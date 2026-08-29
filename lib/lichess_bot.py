@@ -776,6 +776,18 @@ def play_game(li: lichess.Lichess,
                         StopIteration) as e:
                     stopped = isinstance(e, StopIteration)
                     stay_in_game = not stopped and (move_attempted or game_is_active(li, game.id))
+                    # Lokale Ergaenzung, kein Upstream: dieser Zweig war
+                    # stumm. Faellt der Partienstrom aus, stand deshalb
+                    # *nichts* im Protokoll -- anders als beim
+                    # Kontrollstrom, der sich neu verbindet und dabei
+                    # protokolliert. Genau diese Luecke machte den
+                    # Zeitverlust am 28.08. unauswertbar: nach unserem Zug
+                    # 48 nur Stille bis "Game over". Ohne Verhaltensfolge.
+                    if not stopped:
+                        logger.warning(f"Game stream error in {game.id} "
+                                       f"(move_attempted={move_attempted}, "
+                                       f"stay_in_game={stay_in_game}): "
+                                       f"{type(e).__name__}: {e}")
 
             pgn_record = try_get_pgn_game_record(li, config, game, board, engine)
         final_queue_entries(control_queue, correspondence_queue, game, is_correspondence, pgn_record, pgn_queue)
