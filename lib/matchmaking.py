@@ -33,6 +33,31 @@ class Matchmaking:
         self.last_game_ended_delay = Timer(minutes(self.matchmaking_cfg.challenge_timeout))
         self.last_user_profile_update_time = Timer(minutes(5))
         self.min_wait_time = seconds(60)  # Wait before new challenge to avoid api rate limits.
+        # LOCAL PATCH: a declined challenge produced no game, so the full
+        # rate-limit pause is mostly wasted idle time -- the next challenge
+        # also goes to a *different* bot, because challenge_filter blocks
+        # re-challenging the decliner for the same reason. Measured over 394
+        # declines: a median of 63 s each, about seven hours of not
+        # initiating anything. The pause exists for API rate limits, and
+        # there is room: we create 9 challenges per hour (peak 22) where the
+        # 60 s minimum would allow 60, and challenge creation has never been
+        # rate-limited in this bot's whole log history (the 118 rate limits
+        # on record all hit /api/stream/event, a different endpoint).
+        self.min_wait_time_after_decline = seconds(10)
+        # LOCAL PATCH: dasselbe Problem, andere Ursache. Scheitert die
+        # Forderung, weil der *Gegner* sein Tageslimit von 100 Bot-Partien
+        # erreicht hat, entsteht ebenfalls keine Partie -- und es ist nicht
+        # einmal unser Limit. `handle_challenge_error_response` filtert
+        # diesen Gegner ohnehin heraus, die naechste Forderung ginge also an
+        # einen anderen der ueber 300 online stehenden Bots. Trotzdem wurde
+        # die volle Frist abgewartet, weil `challenge()` den Zeitgeber
+        # *vor* dem Versuch zurueckstellt und damit auch dann, wenn gar
+        # nichts zustande kam.
+        # Gemessen ueber elf Tage: 107 Faelle, rund 10 bis 13 taeglich, je
+        # 60 s -- etwa elf Minuten taeglich, in denen nichts gefordert wird.
+        self.min_wait_time_after_failure = seconds(10)
+        self.last_challenge_failed = False
+        self.last_challenge_was_declined = False
         self.rate_limit_timer = Timer()
 
         # Maximum time between challenges, even if there are active games
@@ -59,6 +84,24 @@ class Matchmaking:
             self.local_block_list = Path(self.matchmaking_cfg.challenge_decliner_file_name)
             self.read_local_block_list()
 
+        # Bots that decline with "nobot" have a fixed account policy that won't change,
+        # so these get permanently blocked regardless of challenge_decliner_file_name/permablock,
+        # which would otherwise permablock every decline reason (too fast, wrong variant, etc.).
+        self.nobot_block_list = Path("nobot_blocklist.txt")
+        self.read_nobot_block_list()
+
+    def read_nobot_block_list(self) -> None:
+        """Read the list of bots that declined with 'nobot' in a previous session and block them forever."""
+        if not self.nobot_block_list.exists():
+            return
+
+        logger.debug(f"Reading permanent nobot block list: {self.nobot_block_list}")
+        with self.nobot_block_list.open(encoding="utf8") as local_list:
+            for line_raw in local_list:
+                name = line_raw.strip()
+                if name:
+                    self.add_challenge_filter(name, "", forever, add_to_file=False)
+
     def read_local_block_list(self) -> None:
         """Read the local block list file and reload blocks from previous session."""
         if not self.local_block_list or not self.local_block_list.exists():
@@ -78,13 +121,26 @@ class Matchmaking:
                 name, reason = line.split(",")
                 self.add_challenge_filter(name, reason, forever, add_to_file=False)
 
+    def effective_min_wait_time(self) -> datetime.timedelta:
+        """The minimum pause before the next challenge, shortened after a decline.
+
+        Kept in one place so that the decision in `should_create_challenge` and
+        the time printed by `show_earliest_challenge_time` can never disagree.
+        """
+        if self.last_challenge_was_declined:
+            return self.min_wait_time_after_decline
+        if self.last_challenge_failed:
+            return self.min_wait_time_after_failure
+        return self.min_wait_time
+
     def should_create_challenge(self) -> bool:
         """Whether we should create a challenge."""
         matchmaking_enabled = self.matchmaking_cfg.allow_matchmaking
         rate_limit_ok = self.rate_limit_timer.is_expired()
         time_has_passed = self.last_game_ended_delay.is_expired()
         challenge_expired = self.last_challenge_created_delay.is_expired() and self.challenge_id
-        min_wait_time_passed = self.last_challenge_created_delay.time_since_reset() > self.min_wait_time
+        min_wait_time_passed = (self.last_challenge_created_delay.time_since_reset()
+                                > self.effective_min_wait_time())
         if challenge_expired:
             self.li.cancel(self.challenge_id)
             logger.info(f"Challenge id {self.challenge_id} cancelled.")
@@ -109,6 +165,8 @@ class Matchmaking:
 
         try:
             self.last_challenge_created_delay.reset()
+            self.last_challenge_was_declined = False  # LOCAL PATCH, see __init__
+            self.last_challenge_failed = False  # LOCAL PATCH, see __init__
             response = self.li.challenge(username, params)
             challenge_id = response.get("id", "")
             if not challenge_id:
@@ -133,6 +191,14 @@ class Matchmaking:
         elif response.get("opponent_is_rate_limited"):
             timeout = cast(datetime.timedelta, response.get("rate_limit_timeout"))
             self.add_challenge_filter(username, "", timeout, add_to_file=False)
+            # LOCAL PATCH, siehe __init__: nicht unser Limit, kein Spiel
+            # entstanden, und dieser Gegner ist ab jetzt gefiltert -- die
+            # naechste Forderung geht an einen anderen Bot. Bewusst *nur*
+            # hier gesetzt: bei `bot_is_rate_limited` ist es unser eigenes
+            # Limit (dafuer gibt es `rate_limit_timer`), und beim
+            # unbekannten Fehler im `else`-Zweig kennen wir die Ursache
+            # nicht -- dort weiter zu draengeln waere unklug.
+            self.last_challenge_failed = True
         else:
             self.add_challenge_filter(username, "", days(1), add_to_file=False)
         self.show_earliest_challenge_time()
@@ -307,7 +373,8 @@ class Matchmaking:
         """Show the earliest that the next challenge will be created."""
         if self.matchmaking_cfg.allow_matchmaking:
             postgame_timeout = self.last_game_ended_delay.time_until_expiration()
-            time_to_next_challenge = self.min_wait_time - self.last_challenge_created_delay.time_since_reset()
+            time_to_next_challenge = (self.effective_min_wait_time()
+                                      - self.last_challenge_created_delay.time_since_reset())
             rate_limit_delay = self.rate_limit_timer.time_until_expiration()
             time_left = max(postgame_timeout, time_to_next_challenge, rate_limit_delay)
             earliest_challenge_time = datetime.datetime.now() + time_left
@@ -370,7 +437,17 @@ class Matchmaking:
         reason = event["challenge"]["declineReason"]
         logger.info(f"{opponent} declined {challenge}: {reason}")
         self.discard_challenge(challenge.id)
+        self.last_challenge_was_declined = True  # LOCAL PATCH, see __init__
         if not challenge.from_self or self.challenge_filter == FilterType.NONE:
+            return
+
+        reason_key = event["challenge"]["declineReasonKey"].lower()
+        if reason_key == "nobot":
+            self.add_challenge_filter(opponent.name, "", forever, add_to_file=False)
+            with self.nobot_block_list.open("a", encoding="utf8") as block_list:
+                block_list.write(f"{opponent.name}\n")
+            logger.info(f"{opponent} does not accept challenges from bots - permanently blocked.")
+            self.show_earliest_challenge_time()
             return
 
         mode = "rated" if challenge.rated else "casual"
@@ -385,7 +462,6 @@ class Matchmaking:
                                            "standard": challenge.variant,
                                            "variant": challenge.variant}
 
-        reason_key = event["challenge"]["declineReasonKey"].lower()
         if reason_key not in decline_details:
             logger.warning(f"Unknown decline reason received: {reason_key}")
         game_problem = decline_details.get(reason_key, "") if self.challenge_filter == FilterType.FINE else ""
