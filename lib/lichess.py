@@ -1,6 +1,8 @@
 """Communication with APIs."""
 import json
+import socket
 import requests
+import urllib3.util.connection
 from urllib.parse import urljoin
 from requests.exceptions import ConnectionError as RequestsConnectionError, HTTPError, ReadTimeout
 from http.client import RemoteDisconnected
@@ -16,6 +18,33 @@ import chess.engine
 from lib.lichess_types import (UserProfileType, REQUESTS_PAYLOAD_TYPE, GameType, PublicDataType, OnlineType,
                        ChallengeType, TOKEN_TESTS_TYPE, BackoffDetails)
 
+
+
+# --- IPv4 erzwingen (lokale Anpassung, kein Upstream) ---------------------
+# Der Anschluss hier bekommt taeglich gegen 07:35 eine Zwangstrennung mit
+# einem **neuen IPv6-Praefix** (Fritzbox-Protokoll: jeden Tag ein anderes
+# /56, seit Monaten lueckenlos). Jede bestehende TLS-Verbindung, die eine
+# Adresse aus dem alten Praefix benutzt, stirbt in diesem Moment -- und
+# lichess.org wird per Vorgabe ueber IPv6 erreicht.
+#
+# Belegt: alle 258 "Control stream error" im Bot-Protokoll liegen zwischen
+# 07:32 und 08:45, kein einziger zu einer anderen Tageszeit. Am 28.08. hat
+# das eine gewertete Bullet-Partie gekostet: nach unserem Zug 48 kam kein
+# weiterer Befehl mehr an die Engine, die Uhr lief von 23 s auf null.
+#
+# Ueber IPv4 bleibt die LAN-Adresse ueber die Trennung hinweg stabil; es
+# reissen dann nur die Verbindungen, die im Moment der Trennung offen sind,
+# statt zusaetzlich derer, die eine ablaufende IPv6-Adresse benutzen.
+#
+# `allowed_gai_family` ist der dafuer vorgesehene Haken von urllib3 und
+# wirkt ausschliesslich auf HTTP-Verbindungen -- nicht auf sonstige Sockets
+# im Prozess, anders als ein Eingriff in `socket.getaddrinfo`.
+urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
+
+# Lesezeitlimit der Stroeme: 15 s waren knapp. Lichess sendet alle 6 s ein
+# Lebenszeichen, 30 s lassen also zwei davon ausfallen, bevor die
+# Verbindung verworfen wird.
+STREAM_TIMEOUT = 30
 
 ENDPOINTS = {
     "profile": "/api/account",
@@ -400,11 +429,11 @@ class Lichess:
 
     def get_event_stream(self) -> requests.models.Response:
         """Get a stream of the events (e.g. challenge, gameStart)."""
-        return self.api_get("stream_event", stream=True, timeout=15)
+        return self.api_get("stream_event", stream=True, timeout=STREAM_TIMEOUT)
 
     def get_game_stream(self, game_id: str) -> requests.models.Response:
         """Get  stream of the in-game events (e.g. moves by the opponent)."""
-        return self.api_get("stream", game_id, stream=True, timeout=15)
+        return self.api_get("stream", game_id, stream=True, timeout=STREAM_TIMEOUT)
 
     def accept_challenge(self, challenge_id: str) -> None:
         """Accept a challenge."""
