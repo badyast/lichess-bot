@@ -9,3 +9,12 @@ lichess_bot_auto_logs/*
 *.log
 *.txt
 TEMP/*
+
+# Lokale Ergaenzung: Sicherungskopien der Konfiguration enthalten den
+# Lichess-Token. Die Regel `*.yml` oben greift bei ihnen nicht, weil der
+# Dateiname auf `.bak-<datum>` endet -- ohne diese Zeile wuerde ein
+# `git add -A` den Token einchecken.
+config.yml*
+*.bak
+*.bak-*
+start_local.ps1
