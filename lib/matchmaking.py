@@ -56,6 +56,19 @@ class Matchmaking:
         # Gemessen ueber elf Tage: 107 Faelle, rund 10 bis 13 taeglich, je
         # 60 s -- etwa elf Minuten taeglich, in denen nichts gefordert wird.
         self.min_wait_time_after_failure = seconds(10)
+        # LOCAL PATCH: Bei `tooFast`/`tooSlow` nennt der Gegner die
+        # *Richtung* -- er will mehr oder weniger Bedenkzeit. Diese
+        # Information wegzuwerfen und ihn stattdessen einen Tag lang fuer
+        # diese Geschwindigkeit zu sperren, verschenkt einen Gegner, der
+        # ausdruecklich gesagt hat, wie es klappen wuerde.
+        #
+        # Kleiner Posten: 8 Faelle in elf Tagen gegen 60 bei `later`.
+        # Gemerkt wird `(Name, Richtung)`; die naechste Herausforderung
+        # geht dann an genau diesen Gegner mit angepasster Bedenkzeit.
+        self.nachfassen: tuple[str, str] | None = None
+        # Je Gegner nur *ein* Nachfassen, sonst schaukelt es sich auf:
+        # zu schnell -> langsameres Angebot -> "zu langsam" -> schnelleres ...
+        self.nachgefasst: set[str] = set()
         self.last_challenge_failed = False
         self.last_challenge_was_declined = False
         self.rate_limit_timer = Timer()
@@ -341,6 +354,30 @@ class Matchmaking:
                 or (bot_game_count > 0 and self.last_challenge_created_delay.time_since_reset() < self.max_wait_time)):
             return
 
+        # LOCAL PATCH: ein offenes Nachfassen hat Vorrang vor einem
+        # Zufallsgegner -- der Gegner hat gerade gesagt, was er will.
+        if self.nachfassen:
+            name, richtung = self.nachfassen
+            self.nachfassen = None
+            self.nachgefasst.add(name)
+            zeiten = self.matchmaking_cfg.challenge_initial_time
+            inkremente = self.matchmaking_cfg.challenge_increment
+            # `toofast` heisst "zu wenig Bedenkzeit fuer mich" -> mehr
+            # anbieten; `tooslow` umgekehrt.
+            if richtung == "toofast":
+                basis, ink = max(zeiten), max(inkremente)
+            else:
+                basis, ink = min(zeiten), min(inkremente)
+            variante = self.get_random_config_value(self.matchmaking_cfg, "challenge_variant", self.variants)
+            modus = self.get_random_config_value(self.matchmaking_cfg, "challenge_mode", ["casual", "rated"])
+            logger.info(f"Retrying {name} with {basis}+{ink} after a "
+                        f"{'too fast' if richtung == 'toofast' else 'too slow'} decline.")
+            self.update_user_profile()
+            challenge_id = self.create_challenge(name, basis, ink, 0, variante, modus)
+            logger.info(f"Challenge id is {challenge_id or 'None'}.")
+            self.challenge_id = challenge_id
+            return
+
         logger.info("Challenging a random bot")
         self.update_user_profile()
         bot_username, base_time, increment, days, variant, mode = self.choose_opponent()
@@ -480,6 +517,14 @@ class Matchmaking:
         # 30 Minuten statt eines Tages, und **nicht** in die Datei der
         # dauerhaft gemiedenen Gegner geschrieben -- eine voruebergehende
         # Absage gehoert nicht in eine dauerhafte Liste.
+        # LOCAL PATCH, siehe __init__: Richtung merken und beim naechsten
+        # Zyklus mit angepasster Bedenkzeit nachfassen.
+        if reason_key in ("toofast", "tooslow") and opponent.name not in self.nachgefasst:
+            self.nachfassen = (opponent.name, reason_key)
+            logger.info(f"{opponent} wants a "
+                        f"{'slower' if reason_key == 'toofast' else 'faster'} "
+                        f"time control - will retry with one.")
+
         spaeter = reason_key == "later" and not self.permablock
         if spaeter:
             timeout = minutes(30)
