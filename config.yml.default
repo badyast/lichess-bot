@@ -167,6 +167,10 @@ challenge:                         # Incoming challenges.
   modes:                           # Game modes to accept.
     - casual                       # Unrated games.
     - rated                        # Rated games - must comment if the engine doesn't try to win.
+# human_modes:                     # LOKALE ANPASSUNG: Modi, die von *Menschen* angenommen werden.
+#   - casual                       # Fehlt der Schluessel, gilt 'modes' fuer alle.
+#   - rated                        # Sinnvoll, wenn gegen Bots nur gewertet gespielt werden soll,
+                                   # ein Mensch aber ungewertet spielen koennen soll.
 # block_list:                      # List of users from which the challenges are always declined.
 #   - user1
 #   - user2

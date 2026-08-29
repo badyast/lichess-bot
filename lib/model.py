@@ -84,8 +84,26 @@ class Challenge:
             return days_max == math.inf
 
     def is_supported_mode(self, challenge_cfg: Configuration) -> bool:
-        """Check whether the mode is supported."""
-        return ("rated" if self.rated else "casual") in challenge_cfg.modes
+        """Check whether the mode is supported.
+
+        LOCAL PATCH: `human_modes` gilt fuer Herausforderungen von
+        *Menschen* und tritt dort an die Stelle von `modes`; fehlt der
+        Schluessel, aendert sich nichts.
+
+        **Wozu.** Gegen Bots ist "nur gewertet" richtig -- ungewertete
+        Bot-Partien zaehlen nicht fuer die Wertung und liefern keine
+        anderen Diagnosedaten. Ein Mensch, der gegen den Bot spielen
+        will, ohne seine eigene Wertung zu riskieren, wurde dadurch aber
+        ebenfalls abgewiesen. Gemessen ueber elf Tage: 46 eingehende
+        Herausforderungen abgelehnt, davon 45 von Bots -- und genau eine
+        von einem Menschen, naemlich vom Betreiber selbst.
+        """
+        modi = challenge_cfg.modes
+        if not self.challenger.is_bot:
+            menschlich = challenge_cfg.lookup("human_modes")
+            if menschlich:
+                modi = menschlich
+        return ("rated" if self.rated else "casual") in modi
 
     def is_supported_rating(self, challenge_cfg: Configuration, user_profile: UserProfileType) -> bool:
         """Check whether the challenger's rating is within the acceptable range."""
