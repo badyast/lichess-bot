@@ -465,10 +465,35 @@ class Matchmaking:
         if reason_key not in decline_details:
             logger.warning(f"Unknown decline reason received: {reason_key}")
         game_problem = decline_details.get(reason_key, "") if self.challenge_filter == FilterType.FINE else ""
-        timeout = forever if self.permablock else days(1)
-        self.add_challenge_filter(opponent.name, game_problem, timeout, add_to_file=True)
-        time_span = "" if self.permablock else " today"
-        logger.info(f"Will not challenge {opponent} to another {game_problem}".strip() + f" game{time_span}.")
+
+        # LOCAL PATCH: "later" heisst woertlich "frag spaeter nochmal" -- der
+        # Gegner sagt zu *diesem Zeitpunkt* ab, nicht zu uns oder zu dieser
+        # Partieform. Ihn dafuer einen ganzen Tag zu sperren verschenkt
+        # genau die Gegner, die uns spielen wollen.
+        #
+        # Haeufigster Ablehnungsgrund ueberhaupt: **60 von 200** unserer
+        # abgelehnten Herausforderungen (30 %), gemessen ueber elf Tage.
+        # Die naechsthaeufigen sind "derzeit keine" (53) und "nicht bei
+        # dieser Bedenkzeit" (50); nur bei "later" nennt der Gegner
+        # ausdruecklich die Zeit als Grund.
+        #
+        # 30 Minuten statt eines Tages, und **nicht** in die Datei der
+        # dauerhaft gemiedenen Gegner geschrieben -- eine voruebergehende
+        # Absage gehoert nicht in eine dauerhafte Liste.
+        spaeter = reason_key == "later" and not self.permablock
+        if spaeter:
+            timeout = minutes(30)
+            in_datei = False
+        else:
+            timeout = forever if self.permablock else days(1)
+            in_datei = True
+        self.add_challenge_filter(opponent.name, game_problem, timeout, add_to_file=in_datei)
+        if spaeter:
+            logger.info(f"{opponent} asked to be challenged later - retrying in 30 minutes.")
+        else:
+            time_span = "" if self.permablock else " today"
+            logger.info(f"Will not challenge {opponent} to another {game_problem}".strip()
+                        + f" game{time_span}.")
 
         self.show_earliest_challenge_time()
 
