@@ -62,10 +62,16 @@ class Matchmaking:
         # diese Geschwindigkeit zu sperren, verschenkt einen Gegner, der
         # ausdruecklich gesagt hat, wie es klappen wuerde.
         #
-        # Kleiner Posten: 8 Faelle in elf Tagen gegen 60 bei `later`.
-        # Gemerkt wird `(Name, Richtung)`; die naechste Herausforderung
-        # geht dann an genau diesen Gegner mit angepasster Bedenkzeit.
-        self.nachfassen: tuple[str, str] | None = None
+        # Dasselbe gilt fuer `timeControl` ("nicht bei dieser Bedenkzeit"):
+        # dort fehlt zwar die Richtung, aber wir bieten ohnehin nur zwei
+        # Geschwindigkeiten an -- die andere ist damit wohldefiniert.
+        #
+        # Groessenordnung ueber elf Tage: `timeControl` 50 Faelle,
+        # `tooFast`/`tooSlow` zusammen 8. Zum Vergleich `later` 60.
+        #
+        # Gemerkt wird `(Name, Art, abgelehnte Geschwindigkeit)`; die
+        # naechste Herausforderung geht dann an genau diesen Gegner.
+        self.nachfassen: tuple[str, str, str] | None = None
         # Je Gegner nur *ein* Nachfassen, sonst schaukelt es sich auf:
         # zu schnell -> langsameres Angebot -> "zu langsam" -> schnelleres ...
         self.nachgefasst: set[str] = set()
@@ -357,21 +363,32 @@ class Matchmaking:
         # LOCAL PATCH: ein offenes Nachfassen hat Vorrang vor einem
         # Zufallsgegner -- der Gegner hat gerade gesagt, was er will.
         if self.nachfassen:
-            name, richtung = self.nachfassen
+            name, art, alte_geschwindigkeit = self.nachfassen
             self.nachfassen = None
             self.nachgefasst.add(name)
             zeiten = self.matchmaking_cfg.challenge_initial_time
             inkremente = self.matchmaking_cfg.challenge_increment
-            # `toofast` heisst "zu wenig Bedenkzeit fuer mich" -> mehr
-            # anbieten; `tooslow` umgekehrt.
-            if richtung == "toofast":
-                basis, ink = max(zeiten), max(inkremente)
-            else:
-                basis, ink = min(zeiten), min(inkremente)
             variante = self.get_random_config_value(self.matchmaking_cfg, "challenge_variant", self.variants)
+            # `toofast` heisst "zu wenig Bedenkzeit fuer mich" -> mehr
+            # anbieten; `tooslow` umgekehrt. Bei `timecontrol` nennt der
+            # Gegner keine Richtung -- dort wird die erste konfigurierte
+            # Kombination genommen, die in einer *anderen* Kategorie
+            # landet als die abgelehnte.
+            if art == "toofast":
+                basis, ink = max(zeiten), max(inkremente)
+            elif art == "tooslow":
+                basis, ink = min(zeiten), min(inkremente)
+            else:
+                andere = [(b, i) for b in zeiten for i in inkremente
+                          if game_category(variante, b, i, 0) != alte_geschwindigkeit]
+                if not andere:
+                    # Nur eine Kategorie konfiguriert: nichts anzubieten.
+                    logger.info(f"No other time control configured - not retrying {name}.")
+                    return
+                basis, ink = andere[0]
             modus = self.get_random_config_value(self.matchmaking_cfg, "challenge_mode", ["casual", "rated"])
-            logger.info(f"Retrying {name} with {basis}+{ink} after a "
-                        f"{'too fast' if richtung == 'toofast' else 'too slow'} decline.")
+
+            logger.info(f"Retrying {name} with {basis}+{ink} after a {art} decline.")
             self.update_user_profile()
             challenge_id = self.create_challenge(name, basis, ink, 0, variante, modus)
             logger.info(f"Challenge id is {challenge_id or 'None'}.")
@@ -519,11 +536,11 @@ class Matchmaking:
         # Absage gehoert nicht in eine dauerhafte Liste.
         # LOCAL PATCH, siehe __init__: Richtung merken und beim naechsten
         # Zyklus mit angepasster Bedenkzeit nachfassen.
-        if reason_key in ("toofast", "tooslow") and opponent.name not in self.nachgefasst:
-            self.nachfassen = (opponent.name, reason_key)
-            logger.info(f"{opponent} wants a "
-                        f"{'slower' if reason_key == 'toofast' else 'faster'} "
-                        f"time control - will retry with one.")
+        if (reason_key in ("toofast", "tooslow", "timecontrol")
+                and opponent.name not in self.nachgefasst):
+            self.nachfassen = (opponent.name, reason_key, challenge.speed)
+            wunsch = {"toofast": "slower", "tooslow": "faster"}.get(reason_key, "different")
+            logger.info(f"{opponent} wants a {wunsch} time control - will retry with one.")
 
         spaeter = reason_key == "later" and not self.permablock
         if spaeter:
