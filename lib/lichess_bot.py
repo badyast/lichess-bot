@@ -112,11 +112,29 @@ def upgrade_account(li: lichess.Lichess) -> bool:
     return True
 
 
+CONTROL_STREAM_MIN_WAIT = 1.0
+CONTROL_STREAM_MAX_WAIT = 60.0
+
+
 def watch_control_stream(control_queue: CONTROL_QUEUE_TYPE, li: lichess.Lichess) -> None:
-    """Put the events in a queue."""
+    """
+    Put the events in a queue.
+
+    On failure this backs off rather than retrying once per second. Two
+    reasons, both observed on 2026-08-30: the ISP's daily forced reconnect
+    dropped the stream at 07:33, and the flat one-second retry then produced
+    62 reconnect attempts over 42 minutes, each writing a full traceback. Worse,
+    a RateLimitedError carries the wait lichess itself is asking for, and
+    retrying every second while being told to wait longer keeps the rate limit
+    alive instead of letting it expire. So honour that wait when we are given
+    one, and otherwise double the delay up to a minute, resetting as soon as a
+    stream survives.
+    """
+    wait = CONTROL_STREAM_MIN_WAIT
     while not stop.terminated:
         try:
             with li.get_event_stream() as response:
+                wait = CONTROL_STREAM_MIN_WAIT
                 lines = response.iter_lines()
                 for line in lines:
                     if line:
@@ -124,9 +142,18 @@ def watch_control_stream(control_queue: CONTROL_QUEUE_TYPE, li: lichess.Lichess)
                         control_queue.put_nowait(event)
                     else:
                         control_queue.put_nowait({"type": "ping"})
-        except Exception:
-            logger.warning(f"Control stream error, reconnecting:\n{traceback.format_exc()}")
-            time.sleep(1)
+        except Exception as error:
+            if isinstance(error, lichess.RateLimitedError):
+                pause = max(error.timeout.total_seconds(), CONTROL_STREAM_MIN_WAIT)
+                logger.warning(f"Control stream is rate-limited, waiting {pause:.0f}s: {error}")
+            else:
+                pause = wait
+                wait = min(wait * 2, CONTROL_STREAM_MAX_WAIT)
+                logger.warning(f"Control stream error, reconnecting in {pause:.0f}s:\n{traceback.format_exc()}")
+            # In slices, so a shutdown is not held up by a long backoff.
+            while pause > 0 and not stop.terminated:
+                time.sleep(min(pause, 1.0))
+                pause -= 1.0
 
     control_queue.put_nowait({"type": "terminated"})
 
